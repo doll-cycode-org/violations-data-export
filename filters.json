@@ -1,0 +1,7 @@
+{
+  "category": ["SecretDetection"],
+  "status": ["Open"],
+  "tags": ["verified-by-ai", "Verified by AI", "exist-in-latest-code"],
+  "severities": ["Critical", "High", "Medium", "Low", "Info"],
+  "page_size": 100
+}

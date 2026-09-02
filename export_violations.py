@@ -35,14 +35,20 @@ chain still paginates sequentially via next_page_token, but the 5 severities
 run concurrently. All CSV writing happens once at the end, after every
 severity has finished, so partial/interleaved writes are never a concern.
 
+Filters (category/status/branches/tags/severities/page_size) come from a
+JSON config file rather than being hardcoded -- see FILTERS_FILE below and
+filters.example.json for the schema. Any key omitted from the file falls
+back to the script's built-in default for that key.
+
 Env vars / .env keys:
     CYCODE_CLIENT_ID       (required)
     CYCODE_CLIENT_SECRET   (required)
     CYCODE_BASE_URL        (default: https://api.cycode.com)
     OUTPUT_DIR             (default: ./exports)
     ENV_FILE                (default: .env next to this script)
+    FILTERS_FILE             (default: filters.json next to this script)
     LOG_LEVEL               (default: INFO)
-    MAX_WORKERS              (default: number of severities, currently 5)
+    MAX_WORKERS              (default: number of severities in the filters config)
 """
 import csv
 import datetime
@@ -82,30 +88,91 @@ BASE_URL = os.environ.get("CYCODE_BASE_URL", "https://api.cycode.com").rstrip("/
 TOKEN_PATH = os.environ.get("CYCODE_TOKEN_PATH", "/api/v1/auth/api-token")
 VIOLATIONS_PATH = os.environ.get("CYCODE_VIOLATIONS_PATH", "/v4/violations")
 
-CATEGORY = "SecretDetection"
-STATUS = "Open"
-BRANCHES = ["main", "master"]
-# NOTE: "verified-by-ai" (kebab-case) is the current tag value and is what
-# matches live violations in this tenant today. "Verified by AI" (title
-# case, spaces) is a legacy/pre-rename value -- rare (seen once in ~15.8k
-# rows of historical export data vs. ~15.8k for the kebab-case form) and a
-# live API query for it currently returns 0 results in this tenant, but
-# it's included in the OR-list anyway since it costs nothing and guards
-# against older/un-migrated detections or other tenants still carrying it.
-TAGS = ["verified-by-ai", "Verified by AI", "exist-in-latest-code"]
-PAGE_SIZE = 100
-
-# Violations are queried one severity at a time so each can be fetched
-# concurrently. "NotAvailable" is intentionally excluded -- it shouldn't
-# occur for Open SecretDetection violations, and surfacing it as a bucket
-# tends to raise questions from customers rather than convey anything real.
-SEVERITIES = ["Critical", "High", "Medium", "Low", "Info"]
-
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
 )
 log = logging.getLogger("export_violations")
+
+# Built-in defaults, used for any key missing from the filters JSON file
+# (or if the file itself is absent). See filters.example.json for the
+# on-disk schema this mirrors.
+DEFAULT_FILTERS = {
+    "category": ["SecretDetection"],
+    "status": ["Open"],
+    "branches": ["main", "master"],
+    # NOTE: "verified-by-ai" (kebab-case) is the current tag value and is
+    # what matches live violations in this tenant today. "Verified by AI"
+    # (title case, spaces) is a legacy/pre-rename value -- rare (seen once
+    # in ~15.8k rows of historical export data vs. ~15.8k for the
+    # kebab-case form) and a live API query for it currently returns 0
+    # results in this tenant, but it's included in the OR-list anyway
+    # since it costs nothing and guards against older/un-migrated
+    # detections or other tenants still carrying it.
+    "tags": ["verified-by-ai", "Verified by AI", "exist-in-latest-code"],
+    # Violations are queried one severity at a time so each can be fetched
+    # concurrently. "NotAvailable" is intentionally excluded by default --
+    # it shouldn't occur for Open SecretDetection violations, and
+    # surfacing it as a bucket tends to raise questions from customers
+    # rather than convey anything real. Add it back in the filters JSON
+    # if a given use case actually needs it.
+    "severities": ["Critical", "High", "Medium", "Low", "Info"],
+    "page_size": 100,
+}
+
+
+# Keys where "omitted from filters.json" means *no restriction on that
+# field* (query all values), not "use the default". These map straight to
+# API query filters, and an empty list here is dropped from the request
+# entirely (urlencode(doseq=True) emits nothing for an empty list), so the
+# field is simply left unfiltered.
+UNRESTRICTED_IF_OMITTED = ("category", "status", "branches", "tags")
+
+# Keys that control *how* the script queries rather than *what* it filters
+# on -- these still fall back to DEFAULT_FILTERS if omitted, since e.g. an
+# empty severities list would mean "fetch nothing" rather than "fetch
+# everything".
+MECHANISM_KEYS = ("severities", "page_size")
+
+
+def load_filters(path):
+    """Load filter config from a JSON file. Only used when the file is
+    absent entirely does this return DEFAULT_FILTERS outright; once a file
+    exists, a key it doesn't mention is treated as "don't filter on this"
+    for the UNRESTRICTED_IF_OMITTED keys, and falls back to its default
+    only for the MECHANISM_KEYS."""
+    if not path or not os.path.isfile(path):
+        log.info("No filters file at %s -- using built-in defaults.", path)
+        return dict(DEFAULT_FILTERS)
+
+    with open(path, encoding="utf-8") as f:
+        try:
+            user_filters = json.load(f)
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"Invalid JSON in filters file {path}: {e}")
+
+    unknown_keys = set(user_filters) - set(DEFAULT_FILTERS)
+    if unknown_keys:
+        log.warning("Ignoring unknown key(s) in filters file: %s", ", ".join(sorted(unknown_keys)))
+
+    merged = {}
+    for key in UNRESTRICTED_IF_OMITTED:
+        merged[key] = user_filters.get(key, [])
+    for key in MECHANISM_KEYS:
+        merged[key] = user_filters.get(key, DEFAULT_FILTERS[key])
+    log.info("Loaded filters from %s: %s", path, merged)
+    return merged
+
+
+_default_filters_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "filters.json")
+FILTERS = load_filters(os.environ.get("FILTERS_FILE", _default_filters_file))
+
+CATEGORY = FILTERS["category"]
+STATUS = FILTERS["status"]
+BRANCHES = FILTERS["branches"]
+TAGS = FILTERS["tags"]
+SEVERITIES = FILTERS["severities"]
+PAGE_SIZE = FILTERS["page_size"]
 
 FIELDS = [
     "detection_source_policy_name",
@@ -202,14 +269,18 @@ def fetch_violations_for_severity(token, severity):
     next_page_token = None
     page_num = 0
     while True:
-        params = {
-            "category": CATEGORY,
-            "status": STATUS,
-            "branches": BRANCHES,
-            "tags": TAGS,
-            "severity": [severity],
-            "page_size": PAGE_SIZE,
-        }
+        params = {"severity": [severity], "page_size": PAGE_SIZE}
+        # Empty list means "no restriction on this field" (see
+        # UNRESTRICTED_IF_OMITTED) -- leave it out of the request rather
+        # than sending an empty filter.
+        for key, value in (
+            ("category", CATEGORY),
+            ("status", STATUS),
+            ("branches", BRANCHES),
+            ("tags", TAGS),
+        ):
+            if value:
+                params[key] = value
         if next_page_token:
             params["next_page_token"] = next_page_token
         page = _request("GET", VIOLATIONS_PATH, token=token, params=params)

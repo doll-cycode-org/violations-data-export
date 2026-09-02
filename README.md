@@ -4,11 +4,13 @@ Daily export of open Cycode Secret Detection violations to CSV.
 
 ## What it queries
 
+Filters are config, not code — see [Filters config](#filters-config-filtersjson) below. Out of the box (default `filters.json`, or no file at all):
+
 - **Status:** Open
 - **Category:** SecretDetection
 - **Tags:** `verified-by-ai` OR `Verified by AI` OR `exist-in-latest-code`
 - **Branches:** `main` OR `master`
-- **Severity:** any (Critical, High, Medium, Low, Info) — `NotAvailable` is intentionally excluded; it shouldn't occur for Open SecretDetection violations and tends to raise customer questions if it shows up
+- **Severity:** any (Critical, High, Medium, Low, Info) — `NotAvailable` is intentionally excluded by default; it shouldn't occur for Open SecretDetection violations and tends to raise customer questions if it shows up
 
 ## Setup
 
@@ -25,6 +27,34 @@ Daily export of open Cycode Secret Detection violations to CSV.
    ```
 
 No third-party dependencies — stdlib only (`urllib`, `csv`, `logging`, `concurrent.futures`).
+
+## Filters config (`filters.json`)
+
+Query filters live in a JSON file, not in the script. On startup the script looks for `filters.json` next to `export_violations.py` (override the path with `FILTERS_FILE`); if the file is missing entirely, it silently uses the same built-in defaults listed above.
+
+Once a `filters.json` exists, though, an **omitted key behaves differently depending on what it controls**:
+- `category`, `status`, `branches`, `tags` — these are pure data filters. Omitting one means **no restriction on that field** (query every value), not "fall back to the default". E.g. deleting `"branches": [...]` from your file queries all branches, not just `main`/`master`.
+- `severities`, `page_size` — these control *how* the script queries (severity drives the concurrent-fetch split; see below), not what it filters on. Omitting either still falls back to its built-in default, since e.g. an empty `severities` list would mean "fetch nothing" rather than "fetch everything".
+
+Copy `filters.example.json` to `filters.json` and edit it to get started:
+
+```json
+{
+  "category": ["SecretDetection"],
+  "status": ["Open"],
+  "branches": ["main", "master"],
+  "tags": ["verified-by-ai", "Verified by AI", "exist-in-latest-code"],
+  "severities": ["Critical", "High", "Medium", "Low", "Info"],
+  "page_size": 100
+}
+```
+
+Notes:
+- `category`, `status`, `branches`, `tags` are OR'd within each field by the Cycode API (confirmed empirically — see Considerations below) and AND'd across fields.
+- `severities` is special: each value in the list becomes its own concurrent HTTP fetch (see [How it fetches data](#how-it-fetches-data-concurrency)), rather than being passed as a single multi-value filter. Trimming this list to fewer severities also reduces the number of concurrent requests made.
+- `page_size` is per-request page size (max results per HTTP call within a severity's pagination loop); it doesn't limit the total rows returned.
+- An unrecognized key in the file is ignored with a logged warning rather than failing the run — check your `LOG_LEVEL=INFO` output if a change you made doesn't seem to take effect (likely a typo'd key).
+- Invalid JSON in the file *does* abort the run with a clear error, since silently falling back to defaults there would be more surprising than helpful.
 
 ## Output
 
@@ -49,8 +79,9 @@ The script itself doesn't schedule anything — it's a single run per invocation
 | `CYCODE_BASE_URL` | No | `https://api.cycode.com` | |
 | `OUTPUT_DIR` | No | `./exports` | |
 | `ENV_FILE` | No | `.env` next to the script | |
+| `FILTERS_FILE` | No | `filters.json` next to the script | See [Filters config](#filters-config-filtersjson) |
 | `LOG_LEVEL` | No | `INFO` | `DEBUG` also logs every successful HTTP call with timing |
-| `MAX_WORKERS` | No | `5` (number of severities) | Thread pool size for concurrent severity fetches |
+| `MAX_WORKERS` | No | number of severities in the filters config | Thread pool size for concurrent severity fetches |
 | `CYCODE_TOKEN_PATH` | No | `/api/v1/auth/api-token` | Only needed if your tenant's auth path differs |
 | `CYCODE_VIOLATIONS_PATH` | No | `/v4/violations` | Only needed if your tenant's endpoint path differs |
 
@@ -58,7 +89,7 @@ Real environment variables always take precedence over `.env`.
 
 ## How it fetches data (concurrency)
 
-Violations are fetched **one HTTP call chain per severity value**, running concurrently in a thread pool (`ThreadPoolExecutor`, size = `MAX_WORKERS`). Within a single severity, pages are still fetched sequentially, since each page's request depends on the previous page's `next_page_token` — only the 5 severities run in parallel with each other. All results are held in memory and the CSV is written once at the end, after every severity thread has finished, so there's no risk of a partial or interleaved file if one thread is slower than another.
+Violations are fetched **one HTTP call chain per severity value** (from `filters.json`'s `severities` list), running concurrently in a thread pool (`ThreadPoolExecutor`, size = `MAX_WORKERS`). Within a single severity, pages are still fetched sequentially, since each page's request depends on the previous page's `next_page_token` — only the severities run in parallel with each other. All results are held in memory and the CSV is written once at the end, after every severity thread has finished, so there's no risk of a partial or interleaved file if one thread is slower than another.
 
 The script logs progress per page (`severity=X page=N fetched=... running_total=...`) and a summary per severity as each completes, plus total row count and elapsed time at the end.
 
@@ -76,4 +107,5 @@ The script logs progress per page (`severity=X page=N fetched=... running_total=
 ## Files
 
 - `export_violations.py` — the export script (this is what you run/schedule).
+- `filters.example.json` — copy to `filters.json` (or point `FILTERS_FILE` elsewhere) to configure the query filters.
 - `test_violations_endpoint.py` — connectivity smoke test: authenticates and calls the violations endpoint with only `page_size=1` and no other filters, useful for isolating "is my path/auth wrong" from "is one of my filter params wrong" when debugging.
